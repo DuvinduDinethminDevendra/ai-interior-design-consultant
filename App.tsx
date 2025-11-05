@@ -7,7 +7,7 @@ import { StyleSelector } from './components/StyleSelector';
 import { ImageComparator } from './components/ImageComparator';
 import { ChatInterface } from './components/ChatInterface';
 import { Spinner } from './components/Spinner';
-import { generateRedesignedImage, initializeChat } from './services/geminiService';
+import { generateRedesignedImage, initializeChat } from './services/huggingfaceService';
 import { ChatMessage } from './types';
 import { DESIGN_STYLES } from './constants';
 
@@ -22,6 +22,10 @@ export default function App() {
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [isChatLoading, setIsChatLoading] = useState<boolean>(false);
 
+  // show seconds remaining until automatic retry when quota/time-limited
+  const [retryCountdown, setRetryCountdown] = useState<number | null>(null);
+  const retryTimerRef = useRef<number | null>(null);
+
   const chatRef = useRef<Chat | null>(null);
 
   const handleImageUpload = useCallback(async (file: File) => {
@@ -34,22 +38,70 @@ export default function App() {
         const base64Image = reader.result as string;
         setOriginalImage(base64Image);
         setLoadingMessage(`Generating ${DESIGN_STYLES[0]} design...`);
-        
-        const firstStyleImage = await generateRedesignedImage(base64Image, DESIGN_STYLES[0]);
-        const newGeneratedImages = { [DESIGN_STYLES[0]]: firstStyleImage };
-        setGeneratedImages(newGeneratedImages);
-        setCurrentStyle(DESIGN_STYLES[0]);
-        setChatHistory([]);
-        chatRef.current = initializeChat(DESIGN_STYLES[0]);
 
-        setIsLoading(false);
+        // attempt with basic retry on quota errors
+        const attemptFirstStyle = async (retriesLeft = 2) => {
+          try {
+            const firstStyleImage = await generateRedesignedImage(base64Image, DESIGN_STYLES[0]);
+            const newGeneratedImages = { [DESIGN_STYLES[0]]: firstStyleImage };
+            setGeneratedImages(newGeneratedImages);
+            setCurrentStyle(DESIGN_STYLES[0]);
+            setChatHistory([]);
+            chatRef.current = initializeChat(DESIGN_STYLES[0]);
 
-        // Pre-generate other styles in the background
-        for (let i = 1; i < DESIGN_STYLES.length; i++) {
-          const style = DESIGN_STYLES[i];
-          const image = await generateRedesignedImage(base64Image, style);
-          setGeneratedImages(prev => ({ ...prev, [style]: image }));
-        }
+            // Pre-generate other styles in the background (handle failures per-style)
+            for (let i = 1; i < DESIGN_STYLES.length; i++) {
+              const style = DESIGN_STYLES[i];
+              try {
+                const image = await generateRedesignedImage(base64Image, style);
+                setGeneratedImages(prev => ({ ...prev, [style]: image }));
+              } catch (err) {
+                console.error(`Failed to pre-generate style ${style}:`, err);
+                // don't block other styles — store nothing or a placeholder
+              }
+            }
+            // success -> clear any pending retry countdown
+            if (retryTimerRef.current) {
+              clearInterval(retryTimerRef.current);
+              retryTimerRef.current = null;
+            }
+            setRetryCountdown(null);
+            setIsLoading(false);
+          } catch (err: any) {
+            console.error('Failed to generate first style image:', err);
+            const retryAfter = err?.retryAfter;
+            if (retryAfter && retriesLeft > 0) {
+              // start a visible countdown for the user
+              setLoadingMessage(`Quota exceeded. Retrying in ${retryAfter}s...`);
+              setRetryCountdown(retryAfter);
+              // clear any existing timer
+              if (retryTimerRef.current) {
+                clearInterval(retryTimerRef.current);
+                retryTimerRef.current = null;
+              }
+              retryTimerRef.current = window.setInterval(() => {
+                setRetryCountdown(prev => {
+                  if (prev == null) return null;
+                  if (prev <= 1) {
+                    if (retryTimerRef.current) {
+                      clearInterval(retryTimerRef.current);
+                      retryTimerRef.current = null;
+                    }
+                    // trigger retry after countdown reaches zero
+                    attemptFirstStyle(retriesLeft - 1);
+                    return null;
+                  }
+                  return prev - 1;
+                });
+              }, 1000);
+              return;
+            }
+            setError(typeof err === 'string' ? err : err?.message || 'Failed to generate image.');
+            setIsLoading(false);
+          }
+        };
+
+        attemptFirstStyle(2);
       };
       reader.readAsDataURL(file);
     } catch (err) {
